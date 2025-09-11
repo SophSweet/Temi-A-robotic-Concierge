@@ -8,458 +8,339 @@ HRI survey analysis from CSV
 - Distance stats (mean/median, etc.) + histogram
 - Comfort being approached: overall and by age
 
-Usage:
-  python hri_from_csv.py --csv "path/to/responses.csv" --out "outputs"
-
-Notes:
-- Column names are matched heuristically; override names via CLI if needed.
-- Charts are saved as PNGs; summaries as CSVs and a summary.txt.
 """
+""" HRI survey analysis from preloaded arrays (no pandas).
+- Correlation/regression: Age vs Comfort (with R^2)
+- Categorical comparison: Degree vs Comfort (bar of means + standard errors)
+- Optional: Trust vs Age (if detected)
+- Saves figures to ./hri_outputs_arrays and prints a short summary"""
 
-import argparse
-import os
+
 import re
-import sys
-from typing import List, Optional, Tuple
-
+import math
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 
 # ---------------------------
-# Utilities
+# CONFIG: Optional overrides (use your exact header text if auto-detect misses)
 # ---------------------------
+OVERRIDE_AGE_KEY     = None     # e.g. "What is your age?"
+OVERRIDE_COMFORT_KEY = None     # e.g. "Would you feel comfortable if a robot approached you in public?"
+OVERRIDE_DEGREE_KEY  = None     # e.g. "What degree are you studying?"
+OVERRIDE_TRUST_KEY   = None     # optional trust question
 
-def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    """Return the first column whose lowercase name contains any of the candidate snippets (lowercased)."""
-    low = {c.lower(): c for c in df.columns}
-    for c in df.columns:
-        cl = c.lower()
-        for snippet in candidates:
-            if snippet in cl:
-                return c
+TOP_DEGREE_GROUPS = 7           # show top-K degree buckets, rest → "Other"
+AGE_MIN, AGE_MAX   = 16, 100    # drop clearly-invalid ages
+
+# ---------------------------
+# Import arrays dict
+# ---------------------------
+try:
+    from extract_arrays import arrays
+except Exception as e:
+    raise SystemExit("Could not import 'arrays' from extract_arrays_simple.py. "
+                     "Make sure it's in the same folder and has loaded your CSV.") from e
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def find_key_like(candidates):
+    keys = list(arrays.keys())
+    low = [k.lower() for k in keys]
+    for snip in candidates:
+        s = snip.lower()
+        for i, kl in enumerate(low):
+            if s in kl:
+                return keys[i]
     return None
 
-def map_yes_no_maybe(series: pd.Series) -> pd.Series:
-    """Map common yes/no/maybe/depends strings to numeric: yes=1, maybe/depends=0.5, no=0."""
-    s = series.astype(str).str.strip().str.lower()
-    def classify(x: str) -> float:
-        if "yes" in x:
-            return 1.0
-        if "no" in x:
-            return 0.0
-        if "maybe" in x or "depend" in x or "unsure" in x or "not sure" in x:
-            return 0.5
-        return np.nan
-    return s.map(classify)
+def key_or_fallback(override, fallbacks):
+    if override and override in arrays:
+        return override
+    return find_key_like(fallbacks) if fallbacks else None
 
-def map_yes_no(series: pd.Series) -> pd.Series:
-    """Map yes/no to 1/0; other is NaN."""
-    s = series.astype(str).str.strip().str.lower()
-    return s.map(lambda x: 1.0 if "yes" in x else (0.0 if "no" in x else np.nan))
+def to_str_arr(vals):
+    return np.array([("" if v is None else str(v)).strip() for v in vals], dtype=object)
 
-def parse_age_midpoint(series: pd.Series) -> Tuple[pd.Series, pd.Series]:
-    """
-    Convert age strings like '18-22', '57+', '23-27' or numeric ages to:
-    - numeric midpoint (float) for regression
-    - band label (str) for group summaries
-    """
-    raw = series.astype(str).str.strip()
-    # Numeric ages
-    as_num = pd.to_numeric(raw, errors="coerce")
-    bands = pd.Series(index=series.index, dtype=object)
-    mid = pd.Series(index=series.index, dtype=float)
-
-    for i, v in raw.items():
-        s = v
-        # Numeric
-        if pd.notna(as_num.loc[i]):
-            age = float(as_num.loc[i])
-            mid.loc[i] = age
-            # Create bands ~5-year chunks by default
-            if age < 25: bands.loc[i] = "<25"
-            elif age < 35: bands.loc[i] = "25-34"
-            elif age < 50: bands.loc[i] = "35-49"
-            elif age < 65: bands.loc[i] = "50-64"
-            else: bands.loc[i] = "65+"
+def clean_age(values):
+    """Return numeric ages (float) with ranges/+'s handled and invalids dropped."""
+    vals = to_str_arr(values)
+    out = np.full(vals.shape, np.nan, dtype=float)
+    for i, s in enumerate(vals):
+        if not s: 
             continue
-
-        # Range 'a-b'
+        # Try plain number
+        try:
+            a = float(s)
+            out[i] = a
+            continue
+        except: 
+            pass
+        # Range a-b
         m = re.match(r"^\s*(\d+)\s*-\s*(\d+)\s*$", s)
         if m:
-            a = float(m.group(1)); b = float(m.group(2))
-            mid.loc[i] = (a + b) / 2.0
-            bands.loc[i] = f"{int(a)}-{int(b)}"
+            a = (float(m.group(1)) + float(m.group(2))) / 2.0
+            out[i] = a
             continue
-
-        # 'a+'
+        # a+
         m2 = re.match(r"^\s*(\d+)\s*\+\s*$", s)
         if m2:
-            a = float(m2.group(1))
-            mid.loc[i] = a
-            bands.loc[i] = f"{int(a)}+"
+            out[i] = float(m2.group(1))
+            continue
+        # else leave NaN
+
+    # clamp to plausible range
+    out[(out < AGE_MIN) | (out > AGE_MAX)] = np.nan
+    return out
+
+def clean_text_na(values):
+    vals = to_str_arr(values)
+    bad = {"", "nan", "none", "prefer not to say", "n/a", "na"}
+    return np.array([("" if v.lower() in bad else v) for v in vals], dtype=object)
+
+def map_comfort(values):
+    """
+    Map comfort/trust to 0..1.
+    - If numeric (1..5-like), min-max normalise (0..1).
+    - Else map common yes/no/maybe & Likert text.
+    """
+    vals = to_str_arr(values)
+    # Try numeric scale first
+    as_num = []
+    all_num = True
+    for v in vals:
+        try:
+            as_num.append(float(v))
+        except:
+            all_num = False
+            break
+    if all_num and len(as_num) > 0:
+        as_num = np.array(as_num, dtype=float)
+        mn, mx = np.nanmin(as_num), np.nanmax(as_num)
+        return (as_num - mn) / (mx - mn) if mx > mn else np.full(vals.shape, np.nan)
+
+    # Text mapping
+    out = np.full(vals.shape, np.nan, dtype=float)
+    for i, s in enumerate(vals):
+        sl = s.lower()
+        if not sl:
             continue
 
-        # Fallback: unknown
-        mid.loc[i] = np.nan
-        bands.loc[i] = s if s else np.nan
+        # 5-point Likert phrases
+        if "very comfortable" in sl:      out[i] = 1.0
+        elif "somewhat comfortable" in sl:out[i] = 0.75
+        elif "neither" in sl or "neutral" in sl: out[i] = 0.5
+        elif "somewhat uncomfortable" in sl:      out[i] = 0.25
+        elif "very uncomfortable" in sl:  out[i] = 0.0
 
-    return mid, bands
+        # yes/no/maybe
+        elif "yes" in sl:                 out[i] = 1.0
+        elif "no" in sl:                  out[i] = 0.0
+        elif "maybe" in sl or "depend" in sl or "unsure" in sl or "not sure" in sl:
+            out[i] = 0.5
+        elif "comfortable" in sl and "un" not in sl:
+            out[i] = 1.0
+        elif "uncomfortable" in sl:
+            out[i] = 0.0
+        # else leave NaN
+    return out
 
-def to_numeric_distance(series: pd.Series) -> pd.Series:
-    """Extract numeric value from strings like '0.5 m' -> 0.5."""
-    s = series.astype(str).str.replace(r"[^\d\.\-]", "", regex=True)
-    return pd.to_numeric(s, errors="coerce")
+def linear_regression(x, y):
+    mask = np.isfinite(x) & np.isfinite(y)
+    x2, y2 = x[mask], y[mask]
+    if x2.size < 2 or np.allclose(x2, x2[0]):
+        return np.nan, np.nan, np.nan, mask
+    a, b = np.polyfit(x2, y2, 1)
+    yhat = a*x2 + b
+    ss_res = np.sum((y2 - yhat)**2)
+    ss_tot = np.sum((y2 - np.mean(y2))**2)
+    r2 = 1 - ss_res/ss_tot if ss_tot > 0 else np.nan
+    return a, b, r2, mask
 
-def r2_linear(x: np.ndarray, y: np.ndarray) -> Tuple[float, float, float]:
-    """
-    Simple linear regression y = a*x + b via polyfit; return (a, b, R^2).
-    """
-    if x.size < 2 or y.size < 2:
-        return np.nan, np.nan, np.nan
-    a, b = np.polyfit(x, y, 1)
-    y_hat = a * x + b
-    ss_res = np.sum((y - y_hat) ** 2)
-    ss_tot = np.sum((y - np.mean(y)) ** 2)
-    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
-    return a, b, r2
+def spearman_rho(x, y):
+    """Spearman rank correlation (NaNs dropped)."""
+    mask = np.isfinite(x) & np.isfinite(y)
+    x2, y2 = x[mask], y[mask]
+    if x2.size < 2:
+        return np.nan
+    rx = np.argsort(np.argsort(x2))
+    ry = np.argsort(np.argsort(y2))
+    rx = rx.astype(float); ry = ry.astype(float)
+    rx -= rx.mean(); ry -= ry.mean()
+    denom = (np.sqrt((rx**2).sum()) * np.sqrt((ry**2).sum()))
+    return float((rx*ry).sum()/denom) if denom > 0 else np.nan
 
-def save_bar(values: pd.Series, title: str, xlabel: str, ylabel: str, path: str):
-    plt.figure()
-    values.plot(kind="bar", rot=45)
-    plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.tight_layout()
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
+def group_stats(y, groups):
+    uniq = [g for g in sorted(set(groups)) if g]
+    means, stds, ns = [], [], []
+    for g in uniq:
+        vals = np.array([y[i] for i in range(len(y)) if groups[i]==g and np.isfinite(y[i])], dtype=float)
+        if vals.size == 0:
+            m, s, n = np.nan, np.nan, 0
+        else:
+            m, s, n = float(np.mean(vals)), float(np.std(vals, ddof=1)) if vals.size>1 else 0.0, int(vals.size)
+        means.append(m); stds.append(s); ns.append(n)
+    return uniq, np.array(means), np.array(stds), np.array(ns)
 
-def save_hist(series: pd.Series, bins: int, title: str, xlabel: str, ylabel: str, path: str):
-    plt.figure()
-    series.dropna().plot(kind="hist", bins=bins)
-    plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.tight_layout()
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
+def jitter(n, scale=0.05):
+    return (np.random.rand(n)-0.5)*2*scale
 
-def save_scatter_with_fit(x: pd.Series, y: pd.Series, a: float, b: float, title: str, xlabel: str, ylabel: str, path: str):
-    plt.figure()
-    plt.scatter(x, y)
-    # Regression line
-    xs = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 100)
-    ys = a * xs + b
-    plt.plot(xs, ys)
-    plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.tight_layout()
-    plt.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close()
+# Canonicalise degree text -> bucket
+def canonicalise_degree(values):
+    vals = clean_text_na(values)
+    def bucket(s):
+        sl = s.lower()
+        if not sl: return ""
+        # merge common synonyms
+        if "mechatron" in sl:         return "Mechatronics Eng"
+        if "mechanical" in sl:        return "Mechanical Eng"
+        if "electrical" in sl or "computer and electrical" in sl or "ece" in sl:
+            return "Electrical/Computer Eng"
+        if "software" in sl or "it" == sl or "information technology" in sl or "computer science" in sl:
+            return "Software/IT"
+        if "civil" in sl:             return "Civil Eng"
+        if "chemical" in sl or "process" in sl: return "Chemical/Process"
+        if "biomed" in sl or "bio-med" in sl:   return "Biomedical"
+        if "mining" in sl:            return "Mining Eng"
+        if "aero" in sl:              return "Aerospace Eng"
+        if "science" in sl:           return "Science"
+        if "business" in sl or "commerce" in sl: return "Business/Commerce"
+        if "design" in sl:            return "Design"
+        return "Other"
+    return np.array([bucket(v) for v in vals], dtype=object)
 
 # ---------------------------
-# Main analysis
+# Detect columns
 # ---------------------------
+age_key     = key_or_fallback(OVERRIDE_AGE_KEY,     ["age", "your age", "what is your age"])
+comfort_key = key_or_fallback(OVERRIDE_COMFORT_KEY, ["comfort", "comfortable", "robot approached", "approach you in public", "how comfortable"])
+degree_key  = key_or_fallback(OVERRIDE_DEGREE_KEY,  ["degree", "discipline", "major", "field of study"])
+trust_key   = key_or_fallback(OVERRIDE_TRUST_KEY,   ["trust", "guide you", "museum"])
 
-def main(args):
-    os.makedirs(args.out, exist_ok=True)
+print("Detected keys:")
+print("  Age     :", age_key)
+print("  Comfort :", comfort_key)
+print("  Degree  :", degree_key)
+print("  Trust   :", trust_key)
 
-    # Read CSV
-    df = pd.read_csv(args.csv, encoding="utf-8-sig")
-    # Drop fully empty rows/cols
-    df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
-    n_resp = len(df)
+if not age_key or not comfort_key:
+    raise SystemExit("\nERROR: Need both Age and Comfort. Set OVERRIDE_* to exact headers if detection missed.")
 
-    # Heuristic column detection (override via CLI switches if provided)
-    age_col = args.age or find_col(df, ["what is your age"])
-    trust_col = args.trust or find_col(df, ["trust a robot to guide you"])
-    comfort_public_col = args.comfort_public or find_col(df, ["comfortable if a robot approached", "public setting"])
-    distance_col = args.distance or find_col(df, ["closest distance", "comfortable standing next to a robot", "distance"])
-    prior_exp_col = args.prior or find_col(df, ["have you interacted with a robot before"])
-    multi_col = args.multi or find_col(df, ["what would make you feel more comfortable", "select all"])
+# ---------------------------
+# Prepare & clean
+# ---------------------------
+age     = clean_age(arrays[age_key])
+comfort = map_comfort(arrays[comfort_key])
 
-    # Disability-like columns (we'll scan for several)
-    disability_cols = []
-    for c in df.columns:
-        cl = c.lower()
-        if any(k in cl for k in ["disab", "impair", "access", "mobility", "hearing", "vision", "neurodiv", "condition"]):
-            disability_cols.append(c)
+# ---------------------------
+# 1) Age ↔ Comfort
+# ---------------------------
+a, b, r2, mask = linear_regression(age, comfort)
+rho = spearman_rho(age, comfort)
+print("\n[Age ↔ Comfort]")
+print(f"  Linear: slope={a:.4f}, intercept={b:.4f}, R^2={r2:.4f}")
+print(f"  Spearman ρ={rho:.4f} (rank correlation, robust for ordinal data)")
+print(f"  N used   ={int(np.isfinite(age[mask]).sum())}")
 
-    # --- Outputs registry ---
-    summary_lines = []
-    def add(line):
-        print(line)
-        summary_lines.append(line)
+plt.figure()
+plt.scatter(age[mask], comfort[mask], alpha=0.9)
+xs = np.linspace(float(np.nanmin(age[mask])), float(np.nanmax(age[mask])), 200)
+ys = a*xs + b
+plt.plot(xs, ys, linewidth=2.0)
+plt.title("Comfort vs Age (0..1)\nLinear fit + Spearman ρ shown in console")
+plt.xlabel("Age (midpoint if ranged)")
+plt.ylabel("Comfort score (0..1)")
+plt.tight_layout()
+plt.show()
 
-    add(f"Total respondents: {n_resp}")
-    add("Detected columns:")
-    add(f"  Age: {age_col}")
-    add(f"  Trust (museum guide): {trust_col}")
-    add(f"  Comfort when approached (public): {comfort_public_col}")
-    add(f"  Distance: {distance_col}")
-    add(f"  Prior experience: {prior_exp_col}")
-    add(f"  Multi-select comfort features: {multi_col}")
-    add(f"  Disability-related: {disability_cols if disability_cols else 'None detected'}")
+# Age bands
+bins   = [0, 24, 34, 49, 64, 200]
+labels = ["<25", "25-34", "35-49", "50-64", "65+"]
+age_band = np.array([labels[np.digitize([v], bins)[0]-1] if np.isfinite(v) else "" for v in age], dtype=object)
+uniq, means, stds, ns = group_stats(comfort, age_band)
+sems = np.where(ns>0, stds/np.sqrt(np.maximum(ns, 1)), np.nan)
 
-    # ---------------------------
-    # 1) Comfort level based on age with R^2  (using comfort_public)
-    # ---------------------------
-    if age_col and comfort_public_col:
-        age_mid, age_band = parse_age_midpoint(df[age_col])
-        comfort_score = map_yes_no_maybe(df[comfort_public_col])  # 1, 0.5, 0
-        reg = pd.DataFrame({"age_mid": age_mid, "comfort": comfort_score}).dropna()
-        if not reg.empty and reg["age_mid"].nunique() > 1:
-            a, b, r2 = r2_linear(reg["age_mid"].values, reg["comfort"].values)
-            add(f"[Comfort vs Age] R^2 = {r2:.3f} (y = {a:.4f}*age + {b:.4f}), N={len(reg)}")
-            # Scatter + fit
-            save_scatter_with_fit(reg["age_mid"], reg["comfort"], a, b,
-                                  "Comfort if Approached vs Age (1=yes, 0.5=maybe, 0=no)",
-                                  "Age (midpoint)", "Comfort score",
-                                  os.path.join(args.out, "comfort_vs_age_regression.png"))
-        else:
-            add("[Comfort vs Age] Not enough variation to compute regression.")
-        # By age band: Yes/Maybe/No %
-        band_score = pd.DataFrame({"age_band": age_band, "comfort": comfort_score}).dropna()
-        if not band_score.empty:
-            grp = band_score.groupby("age_band")["comfort"]
-            out = pd.DataFrame({
-                "N": grp.size(),
-                "Yes %": grp.apply(lambda s: (s==1).mean()*100),
-                "Maybe %": grp.apply(lambda s: (s==0.5).mean()*100),
-                "No %": grp.apply(lambda s: (s==0).mean()*100),
-                "Mean comfort": grp.mean()
-            }).round(1).reset_index()
-            out.to_csv(os.path.join(args.out, "comfort_by_age_band.csv"), index=False)
-    else:
-        add("[Comfort vs Age] Missing age or comfort_public column; skipped.")
+print("\n[Comfort by Age Band]  (Mean ± SE, N)")
+for g, m, se, n in zip(uniq, means, sems, ns):
+    se_val = (se if np.isfinite(se) else np.nan)
+    print(f"  {g:<6}  {m:.3f} ± {se_val:.3f}   N={int(n)}")
 
-    # ---------------------------
-    # 2) Analysis based on any disabilities (group comfort & trust if available)
-    # ---------------------------
-    if disability_cols:
-        rows = []
-        for c in disability_cols:
-            # Try a simple yes/no mapping; everything else -> Other/Unknown
-            m = df[c].astype(str).str.strip().str.lower()
-            group = np.where(m.str.contains("yes"), "Disability=Yes",
-                    np.where(m.str.contains("no"), "Disability=No", "Disability=Other/Unknown"))
-            group = pd.Series(group, index=df.index)
+plt.figure()
+x = np.arange(len(uniq))
+plt.bar(x, means, yerr=sems, capsize=4)
+for i,(m,n_) in enumerate(zip(means, ns)):
+    plt.text(i, m+(0.02 if np.isfinite(m) else 0), f"n={int(n_)}", ha="center", va="bottom", fontsize=9)
+plt.xticks(x, uniq)
+plt.title("Mean Comfort by Age Band (±SE, n shown)")
+plt.xlabel("Age Band")
+plt.ylabel("Mean Comfort (0..1)")
+plt.tight_layout()
+plt.show()
 
-            def summarize(target_col: Optional[str], label: str):
-                if not target_col:
-                    return
-                score = map_yes_no_maybe(df[target_col])
-                tmp = pd.DataFrame({"g": group, "s": score}).dropna()
-                if tmp.empty: return
-                g = tmp.groupby("g")["s"]
-                rows.append({
-                    "Column": c, "Target": label,
-                    "Group": "Disability=Yes",   "N": int((tmp["g"]=="Disability=Yes").sum()),
-                    "Yes %": round((tmp[(tmp["g"]=="Disability=Yes") & (tmp["s"]==1)].shape[0]/max(1,(tmp["g"]=="Disability=Yes").sum()))*100,1),
-                    "Maybe %": round((tmp[(tmp["g"]=="Disability=Yes") & (tmp["s"]==0.5)].shape[0]/max(1,(tmp["g"]=="Disability=Yes").sum()))*100,1),
-                    "No %": round((tmp[(tmp["g"]=="Disability=Yes") & (tmp["s"]==0)].shape[0]/max(1,(tmp["g"]=="Disability=Yes").sum()))*100,1),
-                    "Mean": round(tmp.loc[tmp["g"]=="Disability=Yes","s"].mean(),3)
-                })
-                rows.append({
-                    "Column": c, "Target": label,
-                    "Group": "Disability=No",    "N": int((tmp["g"]=="Disability=No").sum()),
-                    "Yes %": round((tmp[(tmp["g"]=="Disability=No") & (tmp["s"]==1)].shape[0]/max(1,(tmp["g"]=="Disability=No").sum()))*100,1),
-                    "Maybe %": round((tmp[(tmp["g"]=="Disability=No") & (tmp["s"]==0.5)].shape[0]/max(1,(tmp["g"]=="Disability=No").sum()))*100,1),
-                    "No %": round((tmp[(tmp["g"]=="Disability=No") & (tmp["s"]==0)].shape[0]/max(1,(tmp["g"]=="Disability=No").sum()))*100,1),
-                    "Mean": round(tmp.loc[tmp["g"]=="Disability=No","s"].mean(),3)
-                })
-                rows.append({
-                    "Column": c, "Target": label,
-                    "Group": "Disability=Other/Unknown", "N": int((tmp["g"]=="Disability=Other/Unknown").sum()),
-                    "Yes %": round((tmp[(tmp["g"]=="Disability=Other/Unknown") & (tmp["s"]==1)].shape[0]/max(1,(tmp["g"]=="Disability=Other/Unknown").sum()))*100,1),
-                    "Maybe %": round((tmp[(tmp["g"]=="Disability=Other/Unknown") & (tmp["s"]==0.5)].shape[0]/max(1,(tmp["g"]=="Disability=Other/Unknown").sum()))*100,1),
-                    "No %": round((tmp[(tmp["g"]=="Disability=Other/Unknown") & (tmp["s"]==0)].shape[0]/max(1,(tmp["g"]=="Disability=Other/Unknown").sum()))*100,1),
-                    "Mean": round(tmp.loc[tmp["g"]=="Disability=Other/Unknown","s"].mean(),3)
-                })
+# ---------------------------
+# 2) Degree ↔ Comfort
+# ---------------------------
+if degree_key:
+    degree_raw = arrays[degree_key]
+    degree = canonicalise_degree(degree_raw)
 
-            summarize(comfort_public_col, "Comfort if approached (public)")
-            summarize(trust_col, "Trust robot to guide (museum)")
+    # Count & keep top groups
+    groups, counts = np.unique(degree[degree!=""], return_counts=True)
+    order = np.argsort(-counts)
+    groups  = groups[order]
+    counts  = counts[order]
 
-        if rows:
-            dis_df = pd.DataFrame(rows)
-            dis_df.to_csv(os.path.join(args.out, "analysis_by_disability.csv"), index=False)
-            add("[Disability] analysis_by_disability.csv written.")
-        else:
-            add("[Disability] No analyzable rows found after mapping; skipped.")
-    else:
-        add("[Disability] No disability-related columns detected; skipped.")
+    top = set(groups[:TOP_DEGREE_GROUPS])
+    degree_top = np.array([g if g in top else ("Other" if g!="" else "") for g in degree], dtype=object)
 
-    # ---------------------------
-    # 3) Comfort based on prior experience
-    # ---------------------------
-    if prior_exp_col and comfort_public_col:
-        exp = map_yes_no(df[prior_exp_col]).map({1.0:"Experienced", 0.0:"New/Low"})
-        score = map_yes_no_maybe(df[comfort_public_col])
-        tmp = pd.DataFrame({"exp": exp, "s": score}).dropna()
-        if not tmp.empty:
-            g = tmp.groupby("exp")
-            out = pd.DataFrame({
-                "N": g.size(),
-                "Yes %": g.apply(lambda s: (s["s"]==1).mean()*100),
-                "Maybe %": g.apply(lambda s: (s["s"]==0.5).mean()*100),
-                "No %": g.apply(lambda s: (s["s"]==0).mean()*100),
-                "Mean comfort": g["s"].mean()
-            }).round(1).reset_index()
-            out.to_csv(os.path.join(args.out, "comfort_by_prior_experience.csv"), index=False)
-            # Bar chart of Yes% by experience
-            save_bar(out.set_index("exp")["Yes %"], "Comfort if Approached – Yes% by Prior Experience",
-                     "Experience Group", "Yes %",
-                     os.path.join(args.out, "comfort_by_experience_bar.png"))
-            add("[Experience] comfort_by_prior_experience.csv written.")
-        else:
-            add("[Experience] Not enough data after mapping; skipped.")
-    else:
-        add("[Experience] Missing columns; skipped.")
+    uniq_d, means_d, stds_d, ns_d = group_stats(comfort, degree_top)
+    # Sort by mean comfort desc
+    order2 = np.argsort(-np.where(np.isfinite(means_d), means_d, -999))
+    uniq_d  = [uniq_d[i] for i in order2]
+    means_d = means_d[order2]
+    ns_d    = ns_d[order2]
+    sems_d  = np.where(ns_d>0, (stds_d[order2]/np.sqrt(np.maximum(ns_d,1))), np.nan)
 
-    # Trust vs experience (bonus)
-    if prior_exp_col and trust_col:
-        exp = map_yes_no(df[prior_exp_col]).map({1.0:"Experienced", 0.0:"New/Low"})
-        score = map_yes_no_maybe(df[trust_col])
-        tmp = pd.DataFrame({"exp": exp, "s": score}).dropna()
-        if not tmp.empty:
-            g = tmp.groupby("exp")
-            out = pd.DataFrame({
-                "N": g.size(),
-                "Yes %": g.apply(lambda s: (s["s"]==1).mean()*100),
-                "Maybe %": g.apply(lambda s: (s["s"]==0.5).mean()*100),
-                "No %": g.apply(lambda s: (s["s"]==0).mean()*100),
-                "Mean score": g["s"].mean()
-            }).round(1).reset_index()
-            out.to_csv(os.path.join(args.out, "trust_by_prior_experience.csv"), index=False)
+    print("\n[Comfort by Degree (canonicalised, top groups; others→Other)]")
+    for g, m, se, n in zip(uniq_d, means_d, sems_d, ns_d):
+        se_val = (se if np.isfinite(se) else np.nan)
+        print(f"  {g:<24}  {m:.3f} ± {se_val:.3f}   N={int(n)}")
 
-    # ---------------------------
-    # 4) Multi-select comfort features
-    # ---------------------------
-    if multi_col:
-        raw = df[multi_col].dropna().astype(str)
-        choices = []
-        for cell in raw:
-            parts = [p.strip() for p in cell.replace(";", ",").split(",") if p.strip()]
-            choices.extend(parts)
-        if choices:
-            counts = pd.Series(choices).value_counts()
-            pct_of_all = (counts / n_resp * 100).round(1)
-            out = pd.DataFrame({"Count": counts, "% of respondents": pct_of_all})
-            out.index.name = "Option"
-            out.reset_index().to_csv(os.path.join(args.out, "comfort_features_counts.csv"), index=False)
-            # Bar chart
-            save_bar(out["% of respondents"].sort_values(ascending=False),
-                     "What would make you more comfortable? (% of all respondents)",
-                     "Option (descending)", "% of respondents",
-                     os.path.join(args.out, "comfort_features_bar.png"))
-            add("[Comfort features] comfort_features_counts.csv written.")
-        else:
-            add("[Comfort features] No selections found; skipped.")
-    else:
-        add("[Comfort features] Multi-select column not detected; skipped.")
+    # Horizontal bar for readability
+    plt.figure()
+    y = np.arange(len(uniq_d))
+    plt.barh(y, means_d, xerr=sems_d, capsize=4)
+    for i,(m,n_) in enumerate(zip(means_d, ns_d)):
+        plt.text(m + 0.02, i, f"n={int(n_)}", va="center", fontsize=9)
+    plt.yticks(y, uniq_d)
+    plt.xlabel("Mean Comfort (0..1)")
+    plt.title("Comfort by Degree/Discipline (±SE, n shown)")
+    plt.tight_layout()
+    plt.show()
+else:
+    print("\n[Degree ↔ Comfort] Degree column not found; skipped.")
 
-    # ---------------------------
-    # 5) Distance stats
-    # ---------------------------
-    if distance_col:
-        dist = to_numeric_distance(df[distance_col])
-        if dist.notna().any():
-            stats = {
-                "N": int(dist.notna().sum()),
-                "Mean_m": round(dist.mean(), 3),
-                "Median_m": round(dist.median(), 3),
-                "Std_m": round(dist.std(ddof=1), 3) if dist.notna().sum() > 1 else 0.0,
-                "P10_m": round(dist.quantile(0.10), 3),
-                "P25_m": round(dist.quantile(0.25), 3),
-                "P75_m": round(dist.quantile(0.75), 3),
-                "P90_m": round(dist.quantile(0.90), 3),
-                "Min_m": round(dist.min(), 3),
-                "Max_m": round(dist.max(), 3),
-            }
-            pd.DataFrame([stats]).to_csv(os.path.join(args.out, "distance_summary.csv"), index=False)
-            save_hist(dist, bins=10, title="Comfortable Distance Distribution", xlabel="Metres",
-                      ylabel="Frequency", path=os.path.join(args.out, "distance_hist.png"))
-            add(f"[Distance] Mean = {stats['Mean_m']} m, Median = {stats['Median_m']} m (distance_summary.csv).")
-        else:
-            add("[Distance] No numeric distance values parsed; skipped.")
-    else:
-        add("[Distance] Distance column not detected; skipped.")
+# ---------------------------
+# 3) Optional: Trust ↔ Age
+# ---------------------------
+if OVERRIDE_TRUST_KEY or trust_key:
+    key = OVERRIDE_TRUST_KEY if OVERRIDE_TRUST_KEY else trust_key
+    trust = map_comfort(arrays[key])
+    a2, b2, r2_2, mask2 = linear_regression(age, trust)
+    rho2 = spearman_rho(age, trust)
+    print("\n[Trust ↔ Age]")
+    print(f"  Linear: slope={a2:.4f}, intercept={b2:.4f}, R^2={r2_2:.4f}")
+    print(f"  Spearman ρ={rho2:.4f}")
 
-    # ---------------------------
-    # 6) Comfort being approached – overall and by age
-    # ---------------------------
-    if comfort_public_col:
-        s = map_yes_no_maybe(df[comfort_public_col])
-        overall = pd.Series({
-            "N": int(s.notna().sum()),
-            "Yes %": round((s==1).mean()*100, 1),
-            "Maybe/Depends %": round((s==0.5).mean()*100, 1),
-            "No %": round((s==0).mean()*100, 1),
-        })
-        overall.to_frame(name="Overall").to_csv(os.path.join(args.out, "comfort_public_overall.csv"))
-        # Bar of overall yes/maybe/no
-        counts = pd.Series({
-            "Yes": int((s==1).sum()),
-            "Maybe/Depends": int((s==0.5).sum()),
-            "No": int((s==0).sum())
-        })
-        save_bar(counts, "Comfort if Approached in Public (overall)", "Response", "Count",
-                 os.path.join(args.out, "comfort_public_overall_bar.png"))
+    plt.figure()
+    plt.scatter(age[mask2], trust[mask2], alpha=0.9)
+    xs = np.linspace(float(np.nanmin(age[mask2])), float(np.nanmax(age[mask2])), 200)
+    ys = a2*xs + b2
+    plt.plot(xs, ys, linewidth=2.0)
+    plt.title("Trust vs Age (0..1)")
+    plt.xlabel("Age (midpoint if ranged)")
+    plt.ylabel("Trust score (0..1)")
+    plt.tight_layout()
+    plt.show()
 
-        # By age band
-        if age_col:
-            _, age_band = parse_age_midpoint(df[age_col])
-            tmp = pd.DataFrame({"age_band": age_band, "s": s}).dropna()
-            if not tmp.empty:
-                g = tmp.groupby("age_band")["s"]
-                by_age = pd.DataFrame({
-                    "N": g.size(),
-                    "Yes %": g.apply(lambda s: (s==1).mean()*100),
-                    "Maybe %": g.apply(lambda s: (s==0.5).mean()*100),
-                    "No %": g.apply(lambda s: (s==0).mean()*100)
-                }).round(1).reset_index()
-                by_age.to_csv(os.path.join(args.out, "comfort_public_by_age.csv"), index=False)
-                # Bar of Yes% by age band
-                save_bar(by_age.set_index("age_band")["Yes %"], "Comfort if Approached – Yes% by Age Band",
-                         "Age Band", "Yes %",
-                         os.path.join(args.out, "comfort_public_yes_by_age_bar.png"))
-    else:
-        add("[Comfort public] Column not detected; skipped.")
-
-    # ---------------------------
-    # (Optional) Trust vs age R^2 for completeness
-    # ---------------------------
-    if age_col and trust_col:
-        age_mid, _ = parse_age_midpoint(df[age_col])
-        trust_score = map_yes_no_maybe(df[trust_col])
-        reg = pd.DataFrame({"age_mid": age_mid, "trust": trust_score}).dropna()
-        if not reg.empty and reg["age_mid"].nunique() > 1:
-            a, b, r2 = r2_linear(reg["age_mid"].values, reg["trust"].values)
-            add(f"[Trust vs Age] R^2 = {r2:.3f} (y = {a:.4f}*age + {b:.4f}), N={len(reg)}")
-            save_scatter_with_fit(reg["age_mid"], reg["trust"], a, b,
-                                  "Trust to be Guided vs Age (1=yes, 0.5=maybe, 0=no)",
-                                  "Age (midpoint)", "Trust score",
-                                  os.path.join(args.out, "trust_vs_age_regression.png"))
-        else:
-            add("[Trust vs Age] Not enough variation to compute regression.")
-
-    # ---------------------------
-    # Write a short summary.txt
-    # ---------------------------
-    with open(os.path.join(args.out, "summary.txt"), "w", encoding="utf-8") as f:
-        f.write("\n".join(summary_lines))
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Analyze HRI survey CSV for comfort/trust & related metrics.")
-    parser.add_argument("--csv", required=True, help="Path to the responses CSV")
-    parser.add_argument("--out", default="hri_outputs_csv", help="Output directory")
-    # Optional explicit column names (if auto-detect misses)
-    parser.add_argument("--age", default=None, help="Exact column name for age")
-    parser.add_argument("--trust", default=None, help="Exact column name for trust-to-guide question")
-    parser.add_argument("--comfort_public", default=None, help="Exact column for 'comfortable if approached in public'")
-    parser.add_argument("--distance", default=None, help="Exact column for numeric distance")
-    parser.add_argument("--prior", default=None, help="Exact column for prior experience with robots")
-    parser.add_argument("--multi", default=None, help="Exact column for multi-select comfort features")
-    args = parser.parse_args()
-    main(args)
+print("\nDone. (Figures were shown; nothing was saved.)")
